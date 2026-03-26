@@ -32,11 +32,11 @@ REFERRAL_REWARDS = {
 }
 
 announcement_messages = [
-    "🌋 Welcome to Primal Abyss! Enjoy your stay",
-    "⚡ Earn 15 energy while you survive",
-    "💬 Join our Discord for rewards & events",
-    "🧬 Use !buy and !claim to get PRIME dinos",
-    "👥 Invite friends to earn bonus energy"
+    "Welcome to Primal Abyss",
+    "Earn energy while you survive",
+    "Join our Discord for rewards",
+    "Use !buy and !claim to get PRIME dinos",
+    "Invite friends for bonus rewards"
 ]
 
 RCON_SCRIPT = r"C:\Users\joshu\Downloads\The-Isle-Evrima-Server-Tools-main\TheIsle_RCON.py"
@@ -316,6 +316,10 @@ def run_rcon(command):
     return result.stdout
 
 
+def clean_message(msg):
+    return msg.encode("ascii", "ignore").decode()
+
+
 def get_players_from_rcon():
     raw = run_rcon("list")
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
@@ -562,9 +566,15 @@ async def announcement_loop():
         current_time = time.time()
         if current_time - last_announcement_time >= 15:
             message = announcement_messages[announcement_index % len(announcement_messages)]
-            print(f"[ANNOUNCEMENT DEBUG] sending: announce {message}")
-            await asyncio.to_thread(run_rcon, f"announce {message}")
-            print(f"[ANNOUNCEMENT SENT] {message}")
+            cleaned = clean_message(message)
+            cmd = f"announce {cleaned}"
+            response = await asyncio.to_thread(run_rcon, cmd)
+            print(f"[ANNOUNCEMENT DEBUG] cmd={cmd}")
+            print(f"[ANNOUNCEMENT RESPONSE] {response}")
+            if "Announced" in response:
+                print(f"[ANNOUNCEMENT SUCCESS] {cleaned}")
+            else:
+                print(f"[ANNOUNCEMENT FAILED] {response}")
             last_announcement_time = current_time
             announcement_index = (announcement_index + 1) % len(announcement_messages)
     except Exception as e:
@@ -589,6 +599,10 @@ async def on_ready():
 
     if last_announcement_time == 0:
         last_announcement_time = time.time() - 600
+
+    await asyncio.sleep(5)
+    test_response = await asyncio.to_thread(run_rcon, "announce TEST MESSAGE FROM BOT")
+    print(f"[STARTUP TEST] {test_response}")
 
     for guild in bot.guilds:
         await cache_guild_invites(guild)
