@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands
 import json
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 TOKEN = "MTQ4NjQ2NTQ4ODczNjQ4NTQ0Ng.GOCPqh.UK1TpRD44ugqS2TkTfdKQalFd6u_O93LFxz2Bw"
 
@@ -11,13 +11,23 @@ LINK_FILE = Path("links.json")
 SHOP_FILE = Path("shop.json")
 PURCHASES_FILE = Path("purchases.json")
 GAME_COMMANDS_FILE = Path("game_commands.json")
+REFERRALS_FILE = Path("referrals.json")
 
 PURCHASE_TIMEOUT_MINUTES = 15
 QUEUED_TIMEOUT_MINUTES = 5
 
+REFERRAL_REWARDS = {
+    5: 15,
+    10: 30,
+    20: 60,
+}
+
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+invite_cache = {}
 
 
 def load_json(path: Path, default):
@@ -53,6 +63,23 @@ def save_game_commands(data):
     save_json(GAME_COMMANDS_FILE, data)
 
 
+def load_referrals():
+    return load_json(REFERRALS_FILE, {})
+
+
+def save_referrals(data):
+    save_json(REFERRALS_FILE, data)
+
+
+def ensure_referral_record(referrals, discord_id: str):
+    if discord_id not in referrals:
+        referrals[discord_id] = {
+            "count": 0,
+            "users": [],
+            "rewards": [],
+        }
+
+
 def get_player(ctx):
     links = load_json(LINK_FILE, {})
     data = load_json(DATA_FILE, {})
@@ -62,6 +89,17 @@ def get_player(ctx):
         return None, None
 
     return data.get(steam_id), steam_id
+
+
+def get_player_by_discord_id(discord_id: str):
+    links = load_json(LINK_FILE, {})
+    data = load_json(DATA_FILE, {})
+
+    steam_id = links.get(discord_id)
+    if not steam_id:
+        return None, None, data
+
+    return data.get(steam_id), steam_id, data
 
 
 def find_shop_price(item_name: str):
@@ -205,9 +243,113 @@ def get_online_players_from_data():
     return online
 
 
+async def cache_guild_invites(guild: discord.Guild):
+    try:
+        invites = await guild.invites()
+        invite_cache[guild.id] = {invite.code: invite.uses for invite in invites}
+    except Exception:
+        if guild.id not in invite_cache:
+            invite_cache[guild.id] = {}
+
+
+def reward_referral_if_eligible(inviter_id: str, guild: discord.Guild):
+    referrals = load_referrals()
+    ensure_referral_record(referrals, inviter_id)
+
+    record = referrals[inviter_id]
+    rewarded_levels = set(record.get("rewards", []))
+    gained_messages = []
+
+    for invite_count, energy_reward in sorted(REFERRAL_REWARDS.items()):
+        reward_key = str(invite_count)
+        if record.get("count", 0) >= invite_count and reward_key not in rewarded_levels:
+            player, steam_id, data = get_player_by_discord_id(inviter_id)
+            if player and steam_id and steam_id in data:
+                data[steam_id]["energy"] = int(data[steam_id].get("energy", 0)) + energy_reward
+                save_json(DATA_FILE, data)
+                record["rewards"].append(reward_key)
+                gained_messages.append(
+                    f"🎉 <@{inviter_id}> reached **{invite_count} invites** and earned **+{energy_reward} energy**!"
+                )
+
+    save_referrals(referrals)
+
+    if gained_messages:
+        general_channel = discord.utils.get(guild.text_channels, name="general")
+        if general_channel:
+            return gained_messages, general_channel
+
+    return [], None
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
+    for guild in bot.guilds:
+        await cache_guild_invites(guild)
+
+
+@bot.event
+async def on_guild_join(guild):
+    await cache_guild_invites(guild)
+
+
+@bot.event
+async def on_member_join(member):
+    if member.bot:
+        return
+
+    general_channel = discord.utils.get(member.guild.text_channels, name="general")
+    if general_channel:
+        await general_channel.send(
+            f"👋 Welcome {member.mention} to Primal Abyss!\n"
+            f"⚡ Earn energy by playing\n"
+            f"🔗 Use !link <steamid>"
+        )
+
+    if datetime.now(timezone.utc) - member.created_at < timedelta(days=1):
+        await cache_guild_invites(member.guild)
+        return
+
+    previous_invites = invite_cache.get(member.guild.id, {})
+    used_inviter_id = None
+
+    try:
+        current_invites = await member.guild.invites()
+    except Exception:
+        current_invites = []
+
+    if current_invites:
+        for invite in current_invites:
+            previous_uses = previous_invites.get(invite.code, 0)
+            if invite.uses > previous_uses and invite.inviter:
+                used_inviter_id = str(invite.inviter.id)
+                break
+
+        invite_cache[member.guild.id] = {invite.code: invite.uses for invite in current_invites}
+
+    if not used_inviter_id:
+        return
+
+    if used_inviter_id == str(member.id):
+        return
+
+    referrals = load_referrals()
+    ensure_referral_record(referrals, used_inviter_id)
+    record = referrals[used_inviter_id]
+
+    if str(member.id) in record["users"]:
+        save_referrals(referrals)
+        return
+
+    record["users"].append(str(member.id))
+    record["count"] = len(record["users"])
+    save_referrals(referrals)
+
+    gained_messages, reward_channel = reward_referral_if_eligible(used_inviter_id, member.guild)
+    if reward_channel and gained_messages:
+        for message in gained_messages:
+            await reward_channel.send(message)
 
 
 @bot.event
@@ -436,6 +578,44 @@ async def myclaims(ctx):
         lines.append(
             f"{p.get('item', '?')} — {p.get('status', '?')} — {p.get('time', '?')}"
         )
+
+    await ctx.send("\n".join(lines))
+
+
+@bot.command()
+async def invites(ctx):
+    referrals = load_referrals()
+    discord_id = str(ctx.author.id)
+    ensure_referral_record(referrals, discord_id)
+    save_referrals(referrals)
+
+    record = referrals[discord_id]
+    await ctx.send(
+        f"🔗 **{ctx.author.display_name}** has **{record.get('count', 0)}** valid invites.\n"
+        f"🏆 Reward milestones: 5 / 10 / 20"
+    )
+
+
+@bot.command()
+async def leaderboard(ctx):
+    referrals = load_referrals()
+
+    leaderboard_rows = []
+    for discord_id, record in referrals.items():
+        leaderboard_rows.append((discord_id, int(record.get("count", 0))))
+
+    if not leaderboard_rows:
+        await ctx.send("📭 No invite referrals tracked yet.")
+        return
+
+    leaderboard_rows.sort(key=lambda x: x[1], reverse=True)
+    top_five = leaderboard_rows[:5]
+
+    lines = ["🏆 **Top Inviters**\n"]
+    for idx, (discord_id, count) in enumerate(top_five, start=1):
+        user = bot.get_user(int(discord_id))
+        display_name = user.name if user else f"User {discord_id}"
+        lines.append(f"{idx}. **{display_name}** — {count} invites")
 
     await ctx.send("\n".join(lines))
 
