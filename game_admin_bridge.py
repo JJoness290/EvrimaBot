@@ -1,8 +1,11 @@
 import discord
 from discord.ext import commands
+from discord.ext import tasks
 import json
 from pathlib import Path
 from datetime import datetime, timedelta
+import time
+from rcon_client import run_rcon
 
 TOKEN = "YOUR_DISCORD_BOT_TOKEN"
 
@@ -18,6 +21,14 @@ QUEUED_TIMEOUT_MINUTES = 5
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+last_announcement_time = 0
+announcement_messages = [
+    "🌋 Welcome to Primal Abyss",
+    "⚡ Earn energy while you survive",
+    "💬 Join our Discord for rewards",
+]
+announcement_index = 0
 
 
 def load_json(path: Path, default):
@@ -205,9 +216,29 @@ def get_online_players_from_data():
     return online
 
 
+def send_rcon_command(command: str):
+    return run_rcon(command)
+
+
+@tasks.loop(seconds=5)
+async def timed_server_announcements():
+    global last_announcement_time
+    global announcement_index
+
+    current_time = time.time()
+
+    if current_time - last_announcement_time >= 600:
+        message = announcement_messages[announcement_index % len(announcement_messages)]
+        send_rcon_command(f"announce {message}")
+        last_announcement_time = current_time
+        announcement_index = (announcement_index + 1) % len(announcement_messages)
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
+    if not timed_server_announcements.is_running():
+        timed_server_announcements.start()
 
 
 @bot.event
