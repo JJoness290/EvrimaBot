@@ -560,9 +560,10 @@ async def announcement_loop():
 
     try:
         current_time = time.time()
-        if current_time - last_announcement_time >= 600:
+        if current_time - last_announcement_time >= 15:
             message = announcement_messages[announcement_index % len(announcement_messages)]
-            await asyncio.to_thread(run_rcon, f"announcement {message}")
+            print(f"[ANNOUNCEMENT DEBUG] sending: announce {message}")
+            await asyncio.to_thread(run_rcon, f"announce {message}")
             print(f"[ANNOUNCEMENT SENT] {message}")
             last_announcement_time = current_time
             announcement_index = (announcement_index + 1) % len(announcement_messages)
@@ -584,10 +585,10 @@ async def on_ready():
 
     if not announcement_loop.is_running():
         announcement_loop.start()
-        print("[ANNOUNCEMENTS STARTED] timed announcement loop online")
+    print("[ANNOUNCEMENTS STARTED]")
 
     if last_announcement_time == 0:
-        last_announcement_time = time.time()
+        last_announcement_time = time.time() - 600
 
     for guild in bot.guilds:
         await cache_guild_invites(guild)
