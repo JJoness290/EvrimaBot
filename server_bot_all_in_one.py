@@ -357,21 +357,46 @@ def send_announcement(message):
     cmd_request_id = 11
 
     try:
-        with socket.create_connection((RCON_IP, int(RCON_PORT)), timeout=10) as sock:
-            sock.settimeout(10)
+        print("[RCON] connecting")
+        with socket.create_connection((RCON_IP, int(RCON_PORT)), timeout=5) as sock:
+            sock.settimeout(5)
 
             auth_packet = _build_rcon_packet(auth_request_id, 3, RCON_PASSWORD)
             sock.sendall(auth_packet)
+            print("[RCON] auth packet sent")
 
-            _read_rcon_packet(sock)
-            auth_response_id, _, auth_response_body = _read_rcon_packet(sock)
+            try:
+                _read_rcon_packet(sock)
+                auth_response_id, _, auth_response_body = _read_rcon_packet(sock)
+                print("[RCON] auth response received")
+            except socket.timeout:
+                return "TIMEOUT waiting for auth response"
+
             if auth_response_id == -1:
-                return f"AUTH_FAILED: {auth_response_body}"
+                return "AUTH FAILED"
 
             command_packet = _build_rcon_packet(cmd_request_id, 2, command)
             sock.sendall(command_packet)
-            _, _, command_response = _read_rcon_packet(sock)
+            print("[RCON] command packet sent")
+            print("[RCON] waiting for command response")
+
+            try:
+                _, _, command_response = _read_rcon_packet(sock)
+            except socket.timeout:
+                print("[RCON] timeout waiting for response")
+                return "TIMEOUT waiting for command response"
+
+            if command_response is None:
+                return "NO RESPONSE from command"
+
+            if command_response == "":
+                return "EMPTY RESPONSE"
+
+            print("[RCON] command response received")
             return command_response
+    except socket.timeout:
+        print("[RCON] timeout waiting for response")
+        return "TIMEOUT waiting for command response"
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -627,6 +652,10 @@ async def announcement_loop():
             print(f"[ANNOUNCEMENT RESPONSE] {response}")
             if "Announced" in response:
                 print("[ANNOUNCEMENT SUCCESS]")
+            elif "TIMEOUT" in response:
+                print("[ANNOUNCEMENT FAILED]")
+            elif "AUTH FAILED" in response:
+                print("[ANNOUNCEMENT FAILED]")
             else:
                 print("[ANNOUNCEMENT FAILED]")
             last_announcement_time = current_time
