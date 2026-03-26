@@ -6,8 +6,6 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import subprocess
 import time
-import socket
-import struct
 
 TOKEN = "MTQ4NjQ2NTQ4ODczNjQ4NTQ0Ng.GOCPqh.UK1TpRD44ugqS2TkTfdKQalFd6u_O93LFxz2Bw"
 
@@ -322,83 +320,24 @@ def clean_message(msg):
     return msg.encode("ascii", "ignore").decode()
 
 
-def _build_rcon_packet(request_id: int, packet_type: int, body: str) -> bytes:
-    payload = struct.pack("<ii", request_id, packet_type) + body.encode("utf-8") + b"\x00\x00"
-    return struct.pack("<i", len(payload)) + payload
-
-
-def _recv_exact(sock: socket.socket, size: int) -> bytes:
-    data = b""
-    while len(data) < size:
-        chunk = sock.recv(size - len(data))
-        if not chunk:
-            break
-        data += chunk
-    return data
-
-
-def _read_rcon_packet(sock: socket.socket):
-    header = _recv_exact(sock, 4)
-    if len(header) < 4:
-        return None, None, ""
-    (packet_size,) = struct.unpack("<i", header)
-    payload = _recv_exact(sock, packet_size)
-    if len(payload) < 8:
-        return None, None, ""
-    request_id, packet_type = struct.unpack("<ii", payload[:8])
-    body = payload[8:-2].decode("utf-8", errors="ignore")
-    return request_id, packet_type, body
-
-
 def send_announcement(message):
     cleaned = clean_message(message)
     command = f"announce {cleaned}"
-    auth_request_id = 10
-    cmd_request_id = 11
+    print(f"[ANNOUNCEMENT DEBUG] cmd=announce {cleaned}")
+    result = subprocess.run([
+        "python",
+        RCON_SCRIPT,
+        "--ip", RCON_IP,
+        "--port", RCON_PORT,
+        "--password", RCON_PASSWORD,
+        "--command", command
+    ], input="\n", capture_output=True, text=True)
 
-    try:
-        print("[RCON] connecting")
-        with socket.create_connection((RCON_IP, int(RCON_PORT)), timeout=5) as sock:
-            sock.settimeout(5)
+    print(f"[ANNOUNCEMENT RETURN CODE] {result.returncode}")
+    print(f"[ANNOUNCEMENT STDOUT] {result.stdout}")
+    print(f"[ANNOUNCEMENT STDERR] {result.stderr}")
 
-            auth_packet = _build_rcon_packet(auth_request_id, 3, RCON_PASSWORD)
-            sock.sendall(auth_packet)
-            print("[RCON] auth packet sent")
-
-            try:
-                _read_rcon_packet(sock)
-                auth_response_id, _, auth_response_body = _read_rcon_packet(sock)
-                print("[RCON] auth response received")
-            except socket.timeout:
-                return "TIMEOUT waiting for auth response"
-
-            if auth_response_id == -1:
-                return "AUTH FAILED"
-
-            command_packet = _build_rcon_packet(cmd_request_id, 2, command)
-            sock.sendall(command_packet)
-            print("[RCON] command packet sent")
-            print("[RCON] waiting for command response")
-
-            try:
-                _, _, command_response = _read_rcon_packet(sock)
-            except socket.timeout:
-                print("[RCON] timeout waiting for response")
-                return "TIMEOUT waiting for command response"
-
-            if command_response is None:
-                return "NO RESPONSE from command"
-
-            if command_response == "":
-                return "EMPTY RESPONSE"
-
-            print("[RCON] command response received")
-            return command_response
-    except socket.timeout:
-        print("[RCON] timeout waiting for response")
-        return "TIMEOUT waiting for command response"
-    except Exception as e:
-        return f"ERROR: {e}"
+    return (result.stdout or "") + (result.stderr or "")
 
 
 def get_players_from_rcon():
