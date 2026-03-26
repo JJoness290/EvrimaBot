@@ -6,6 +6,8 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import subprocess
 import time
+import socket
+import struct
 
 TOKEN = "MTQ4NjQ2NTQ4ODczNjQ4NTQ0Ng.GOCPqh.UK1TpRD44ugqS2TkTfdKQalFd6u_O93LFxz2Bw"
 
@@ -320,6 +322,60 @@ def clean_message(msg):
     return msg.encode("ascii", "ignore").decode()
 
 
+def _build_rcon_packet(request_id: int, packet_type: int, body: str) -> bytes:
+    payload = struct.pack("<ii", request_id, packet_type) + body.encode("utf-8") + b"\x00\x00"
+    return struct.pack("<i", len(payload)) + payload
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def _read_rcon_packet(sock: socket.socket):
+    header = _recv_exact(sock, 4)
+    if len(header) < 4:
+        return None, None, ""
+    (packet_size,) = struct.unpack("<i", header)
+    payload = _recv_exact(sock, packet_size)
+    if len(payload) < 8:
+        return None, None, ""
+    request_id, packet_type = struct.unpack("<ii", payload[:8])
+    body = payload[8:-2].decode("utf-8", errors="ignore")
+    return request_id, packet_type, body
+
+
+def send_announcement(message):
+    cleaned = clean_message(message)
+    command = f"announce {cleaned}"
+    auth_request_id = 10
+    cmd_request_id = 11
+
+    try:
+        with socket.create_connection((RCON_IP, int(RCON_PORT)), timeout=10) as sock:
+            sock.settimeout(10)
+
+            auth_packet = _build_rcon_packet(auth_request_id, 3, RCON_PASSWORD)
+            sock.sendall(auth_packet)
+
+            _read_rcon_packet(sock)
+            auth_response_id, _, auth_response_body = _read_rcon_packet(sock)
+            if auth_response_id == -1:
+                return f"AUTH_FAILED: {auth_response_body}"
+
+            command_packet = _build_rcon_packet(cmd_request_id, 2, command)
+            sock.sendall(command_packet)
+            _, _, command_response = _read_rcon_packet(sock)
+            return command_response
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
 def get_players_from_rcon():
     raw = run_rcon("list")
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
@@ -566,15 +622,13 @@ async def announcement_loop():
         current_time = time.time()
         if current_time - last_announcement_time >= 15:
             message = announcement_messages[announcement_index % len(announcement_messages)]
-            cleaned = clean_message(message)
-            cmd = f"announce {cleaned}"
-            response = await asyncio.to_thread(run_rcon, cmd)
-            print(f"[ANNOUNCEMENT DEBUG] cmd={cmd}")
+            print(f"[ANNOUNCEMENT DEBUG] sending: announce {message}")
+            response = await asyncio.to_thread(send_announcement, message)
             print(f"[ANNOUNCEMENT RESPONSE] {response}")
             if "Announced" in response:
-                print(f"[ANNOUNCEMENT SUCCESS] {cleaned}")
+                print("[ANNOUNCEMENT SUCCESS]")
             else:
-                print(f"[ANNOUNCEMENT FAILED] {response}")
+                print("[ANNOUNCEMENT FAILED]")
             last_announcement_time = current_time
             announcement_index = (announcement_index + 1) % len(announcement_messages)
     except Exception as e:
@@ -601,7 +655,7 @@ async def on_ready():
         last_announcement_time = time.time() - 600
 
     await asyncio.sleep(5)
-    test_response = await asyncio.to_thread(run_rcon, "announce TEST MESSAGE FROM BOT")
+    test_response = await asyncio.to_thread(send_announcement, "TEST MESSAGE FROM BOT")
     print(f"[STARTUP TEST] {test_response}")
 
     for guild in bot.guilds:
