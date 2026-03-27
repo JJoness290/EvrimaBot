@@ -5,6 +5,10 @@ from datetime import datetime
 
 ANNOUNCEMENT_QUEUE_FILE = Path("announcement_queue.json")
 WINDOW_TITLE_CONTAINS = "Evrima RCON"
+RCON_WINDOW_KEYWORDS = [
+    "evrima rcon",
+    "rcon"
+]
 REQUIRE_EXISTING_WINDOW = True
 
 
@@ -44,15 +48,22 @@ def find_existing_rcon_window():
         return None
 
     try:
-        matching = []
-        for title in gw.getAllTitles():
-            if title and WINDOW_TITLE_CONTAINS.lower() in title.lower():
-                matching.append(title)
+        titles = [title for title in gw.getAllTitles() if title and title.strip()]
+        print(f"[RCON GUI EXECUTOR] Candidate window titles: {titles}")
 
-        if not matching:
+        selected_title = None
+        for title in titles:
+            lowered = title.lower()
+            if any(keyword in lowered for keyword in RCON_WINDOW_KEYWORDS):
+                selected_title = title
+                break
+
+        if not selected_title:
+            print("[RCON GUI EXECUTOR] No matching RCON window found")
             return None
 
-        target_window = gw.getWindowsWithTitle(matching[0])[0]
+        print(f"[RCON GUI EXECUTOR] Selected window: {selected_title}")
+        target_window = gw.getWindowsWithTitle(selected_title)[0]
         return target_window
     except Exception:
         return None
