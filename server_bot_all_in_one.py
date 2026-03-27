@@ -1,20 +1,31 @@
+import asyncio
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+import subprocess
+import time
+import socket
+import struct
 
 TOKEN = "MTQ4NjQ2NTQ4ODczNjQ4NTQ0Ng.GOCPqh.UK1TpRD44ugqS2TkTfdKQalFd6u_O93LFxz2Bw"
 
 DATA_FILE = Path("player_data.json")
+STATE_FILE = Path("player_state.json")
 LINK_FILE = Path("links.json")
 SHOP_FILE = Path("shop.json")
 PURCHASES_FILE = Path("purchases.json")
 GAME_COMMANDS_FILE = Path("game_commands.json")
 REFERRALS_FILE = Path("referrals.json")
+CONFIG_FILE = Path("config.json")
 
 PURCHASE_TIMEOUT_MINUTES = 15
 QUEUED_TIMEOUT_MINUTES = 5
+
+DEFAULT_SCAN_INTERVAL = 5
+DEFAULT_REWARD_INTERVAL_MINUTES = 60
+DEFAULT_REWARD_AMOUNT = 15
 
 REFERRAL_REWARDS = {
     5: 15,
@@ -22,12 +33,30 @@ REFERRAL_REWARDS = {
     20: 60,
 }
 
+announcement_messages = [
+    "Welcome to Primal Abyss",
+    "Earn energy while you survive",
+    "Join our Discord for rewards",
+    "Use !buy and !claim to get PRIME dinos",
+    "Invite friends for bonus rewards"
+]
+
+RCON_SCRIPT = r"C:\Users\joshu\Downloads\The-Isle-Evrima-Server-Tools-main\TheIsle_RCON.py"
+RCON_IP = "68.168.208.54"
+RCON_PORT = "11218"
+RCON_PASSWORD = "qFHrZpel6qwF"
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 invite_cache = {}
+online_since = {}
+last_minute_tick = {}
+
+last_announcement_time = 0
+announcement_index = 0
 
 
 def load_json(path: Path, default):
@@ -41,6 +70,28 @@ def load_json(path: Path, default):
 
 def save_json(path: Path, data) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def load_config():
+    return load_json(CONFIG_FILE, {})
+
+
+def get_scan_interval_seconds() -> int:
+    config = load_config()
+    value = int(config.get("scan_interval", DEFAULT_SCAN_INTERVAL))
+    return max(1, value)
+
+
+def get_reward_interval_minutes() -> int:
+    config = load_config()
+    value = int(config.get("interval_minutes", DEFAULT_REWARD_INTERVAL_MINUTES))
+    return max(1, value)
+
+
+def get_reward_amount() -> int:
+    config = load_config()
+    value = int(config.get("energy_per_interval", DEFAULT_REWARD_AMOUNT))
+    return max(1, value)
 
 
 def load_shop():
@@ -69,6 +120,18 @@ def load_referrals():
 
 def save_referrals(data):
     save_json(REFERRALS_FILE, data)
+
+
+def load_state():
+    return load_json(STATE_FILE, {"online_since": {}, "last_minute_tick": {}})
+
+
+def save_state():
+    state = {
+        "online_since": online_since,
+        "last_minute_tick": last_minute_tick,
+    }
+    save_json(STATE_FILE, state)
 
 
 def ensure_referral_record(referrals, discord_id: str):
@@ -243,6 +306,292 @@ def get_online_players_from_data():
     return online
 
 
+def run_rcon(command):
+    result = subprocess.run([
+        "python",
+        RCON_SCRIPT,
+        "--ip", RCON_IP,
+        "--port", RCON_PORT,
+        "--password", RCON_PASSWORD,
+        "--command", command
+    ], input="\n", capture_output=True, text=True)
+    return (result.stdout or "") + (result.stderr or "")
+
+
+def clean_message(msg):
+    return msg.encode("ascii", "ignore").decode()
+
+
+def _build_rcon_packet(request_id: int, packet_type: int, body: str) -> bytes:
+    payload = struct.pack("<ii", request_id, packet_type) + body.encode("utf-8") + b"\x00\x00"
+    return struct.pack("<i", len(payload)) + payload
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def _recv_rcon_packet(sock: socket.socket):
+    header = _recv_exact(sock, 4)
+    if len(header) < 4:
+        return None
+    (packet_size,) = struct.unpack("<i", header)
+    payload = _recv_exact(sock, packet_size)
+    if len(payload) < 8:
+        return None
+    request_id, packet_type = struct.unpack("<ii", payload[:8])
+    body = payload[8:-2].decode("utf-8", errors="ignore")
+    return request_id, packet_type, body
+
+
+def send_announcement_silent(message: str):
+    cleaned = clean_message(message)
+    command = f"announce {cleaned}"
+    auth_request_id = 101
+    command_request_id = 102
+    terminator_request_id = 103
+
+    print(f"[ANNOUNCEMENT DEBUG] sending: {command}")
+
+    try:
+        with socket.create_connection((RCON_IP, int(RCON_PORT)), timeout=5) as sock:
+            sock.settimeout(5)
+
+            sock.sendall(_build_rcon_packet(auth_request_id, 3, RCON_PASSWORD))
+
+            auth_ok = False
+            auth_deadline = time.time() + 5
+            while time.time() < auth_deadline:
+                packet = _recv_rcon_packet(sock)
+                if packet is None:
+                    continue
+                request_id, _, _ = packet
+                if request_id == -1:
+                    return "AUTH FAILED"
+                if request_id == auth_request_id:
+                    auth_ok = True
+                    break
+
+            if not auth_ok:
+                return "AUTH TIMEOUT"
+
+            sock.sendall(_build_rcon_packet(command_request_id, 2, command))
+            sock.sendall(_build_rcon_packet(terminator_request_id, 2, ""))
+
+            response_parts = []
+            response_deadline = time.time() + 5
+            while time.time() < response_deadline:
+                packet = _recv_rcon_packet(sock)
+                if packet is None:
+                    continue
+                request_id, _, body = packet
+                if request_id == command_request_id and body:
+                    response_parts.append(body)
+                if request_id == terminator_request_id:
+                    break
+
+            response = "\n".join(part for part in response_parts if part).strip()
+            if response:
+                return response
+            return "NO RESPONSE"
+    except socket.timeout:
+        return "TIMEOUT"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def get_players_from_rcon():
+    raw = run_rcon("list")
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+
+    ids, names = None, None
+
+    for line in lines:
+        if "," not in line:
+            continue
+
+        parts = [p.strip() for p in line.split(",") if p.strip()]
+
+        if all(p.isdigit() for p in parts):
+            ids = parts
+        else:
+            names = parts
+
+    if not ids or not names:
+        return {}
+
+    return {ids[i]: names[i] for i in range(min(len(ids), len(names)))}
+
+
+def restore_state():
+    state = load_state()
+    saved_online_since = state.get("online_since", {})
+    saved_last_tick = state.get("last_minute_tick", {})
+
+    if isinstance(saved_online_since, dict):
+        online_since.update({str(k): int(v) for k, v in saved_online_since.items()})
+    if isinstance(saved_last_tick, dict):
+        last_minute_tick.update({str(k): int(v) for k, v in saved_last_tick.items()})
+
+
+def update_players(players):
+    data = load_json(DATA_FILE, {})
+    now = int(time.time())
+    current_ids = set(players.keys())
+
+    for steam_id, name in players.items():
+        if steam_id not in data:
+            data[steam_id] = {
+                "name": name,
+                "steam_id": steam_id,
+                "total_minutes": 0,
+                "current_session_minutes": 0,
+                "energy": 0,
+                "sessions": 0,
+            }
+
+        data[steam_id]["name"] = name
+        data[steam_id]["steam_id"] = steam_id
+
+        if steam_id not in online_since:
+            online_since[steam_id] = now
+            last_minute_tick[steam_id] = now
+            data[steam_id]["sessions"] = int(data[steam_id].get("sessions", 0)) + 1
+
+        session_minutes = (now - online_since[steam_id]) // 60
+        data[steam_id]["current_session_minutes"] = int(session_minutes)
+
+    for steam_id in list(online_since.keys()):
+        if steam_id not in current_ids:
+            if steam_id in data:
+                data[steam_id]["current_session_minutes"] = 0
+            del online_since[steam_id]
+            last_minute_tick.pop(steam_id, None)
+
+    save_json(DATA_FILE, data)
+    save_state()
+
+
+def tick_rewards():
+    data = load_json(DATA_FILE, {})
+    now = int(time.time())
+
+    reward_interval_minutes = get_reward_interval_minutes()
+    reward_amount = get_reward_amount()
+
+    for steam_id in list(online_since.keys()):
+        if steam_id not in data:
+            continue
+
+        last_tick = last_minute_tick.get(steam_id, now)
+        elapsed = now - last_tick
+
+        if elapsed < 60:
+            continue
+
+        whole_minutes = elapsed // 60
+        if whole_minutes <= 0:
+            continue
+
+        player = data[steam_id]
+
+        old_total = int(player.get("total_minutes", 0))
+        new_total = old_total + whole_minutes
+
+        old_rewards = old_total // reward_interval_minutes
+        new_rewards = new_total // reward_interval_minutes
+        gained_energy = (new_rewards - old_rewards) * reward_amount
+
+        player["total_minutes"] = new_total
+        player["current_session_minutes"] = int((now - online_since[steam_id]) // 60)
+
+        if gained_energy > 0:
+            player["energy"] = int(player.get("energy", 0)) + gained_energy
+            print(
+                f"[REWARD] {player.get('name', steam_id)} | "
+                f"{steam_id} | +{gained_energy} energy | "
+                f"total={player['total_minutes']} mins | "
+                f"energy={player['energy']}"
+            )
+
+        last_minute_tick[steam_id] = last_tick + (whole_minutes * 60)
+
+    save_json(DATA_FILE, data)
+    save_state()
+
+
+def print_live_status(players):
+    data = load_json(DATA_FILE, {})
+
+    print(f"\n--- Online: {len(players)} ---")
+    for steam_id, name in players.items():
+        p = data.get(steam_id, {})
+        session = int(p.get("current_session_minutes", 0))
+        total = int(p.get("total_minutes", 0))
+        energy = int(p.get("energy", 0))
+
+        print(
+            f"{name} | "
+            f"{steam_id} | "
+            f"session={session} mins | "
+            f"total={total} mins | "
+            f"energy={energy}"
+        )
+
+
+def process_game_command_queue():
+    game_commands = load_game_commands()
+    purchases = load_purchases()
+
+    changed_commands = False
+    changed_purchases = False
+
+    for cmd in game_commands:
+        if cmd.get("status") != "PENDING":
+            continue
+
+        steam_id = cmd.get("steam_id")
+        item = str(cmd.get("item", "")).lower().strip()
+        command_text = cmd.get("command", "")
+
+        cmd["status"] = "SENDING"
+        changed_commands = True
+
+        try:
+            run_rcon(command_text)
+            cmd["status"] = "SENT"
+            cmd["completed_at"] = str(datetime.now())
+            print(f"[CLAIM QUEUED] {steam_id} | {item} | {command_text}")
+
+            for purchase in purchases:
+                if (
+                    purchase.get("steam_id") == steam_id
+                    and str(purchase.get("item", "")).lower().strip() == item
+                    and purchase.get("status") == "QUEUED_FOR_PRIME"
+                    and str(command_text).startswith("/hunger ")
+                ):
+                    purchase["status"] = "DELIVERED"
+                    purchase["delivery_note"] = command_text
+                    changed_purchases = True
+
+        except Exception as e:
+            cmd["status"] = "FAILED"
+            cmd["completed_at"] = str(datetime.now())
+            cmd["error"] = str(e)
+            print(f"[ERROR] claim queue send failed: {e}")
+
+    if changed_commands:
+        save_game_commands(game_commands)
+    if changed_purchases:
+        save_purchases(purchases)
+
+
 async def cache_guild_invites(guild: discord.Guild):
     try:
         invites = await guild.invites()
@@ -282,9 +631,63 @@ def reward_referral_if_eligible(inviter_id: str, guild: discord.Guild):
     return [], None
 
 
+@tasks.loop(seconds=1)
+async def tracking_loop():
+    try:
+        players = await asyncio.to_thread(get_players_from_rcon)
+        update_players(players)
+        tick_rewards()
+        expire_old_purchases()
+        await asyncio.to_thread(process_game_command_queue)
+        print_live_status(players)
+    except Exception as e:
+        print(f"[ERROR] tracking loop failed: {e}")
+
+
+@tasks.loop(seconds=5)
+async def announcement_loop():
+    global last_announcement_time
+    global announcement_index
+
+    try:
+        current_time = time.time()
+        if current_time - last_announcement_time >= 15:
+            message = announcement_messages[announcement_index % len(announcement_messages)]
+            response = await asyncio.to_thread(send_announcement_silent, message)
+            print(f"[ANNOUNCEMENT RESPONSE] {response}")
+            if "Announced" in response or "announced" in response:
+                print("[ANNOUNCEMENT SUCCESS]")
+            else:
+                print("[ANNOUNCEMENT FAILED]")
+            last_announcement_time = current_time
+            announcement_index = (announcement_index + 1) % len(announcement_messages)
+    except Exception as e:
+        print(f"[ERROR] announcement loop failed: {e}")
+
+
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}")
+    global last_announcement_time
+
+    print(f"[BOT STARTED] Logged in as {bot.user}")
+    restore_state()
+
+    if not tracking_loop.is_running():
+        tracking_loop.change_interval(seconds=get_scan_interval_seconds())
+        tracking_loop.start()
+        print("[TRACKING STARTED] background tracking loop online")
+
+    if not announcement_loop.is_running():
+        announcement_loop.start()
+    print("[ANNOUNCEMENTS STARTED]")
+
+    if last_announcement_time == 0:
+        last_announcement_time = time.time() - 15
+
+    await asyncio.sleep(5)
+    startup_response = await asyncio.to_thread(send_announcement_silent, "TEST MESSAGE FROM BOT")
+    print(f"[ANNOUNCEMENT RESPONSE] {startup_response}")
+
     for guild in bot.guilds:
         await cache_guild_invites(guild)
 
@@ -512,9 +915,13 @@ async def claim(ctx):
 
     game_commands = load_game_commands()
 
+    prime_command_text = f"/elder {steam_id} prime"
+    hunger_command_text = f"/hunger {steam_id} 100"
+
     existing_pending = any(
         cmd.get("steam_id") == steam_id
         and str(cmd.get("item", "")).lower().strip() == str(purchases[purchase_index]["item"]).lower().strip()
+        and str(cmd.get("command", "")) in {prime_command_text, hunger_command_text}
         and cmd.get("status") in {"PENDING", "SENDING"}
         for cmd in game_commands
     )
@@ -528,7 +935,7 @@ async def claim(ctx):
         return
 
     next_id = get_next_command_id(game_commands)
-    command_text = f"/elder {steam_id} prime"
+    command_text = prime_command_text
 
     game_commands.append({
         "id": f"cmd_{next_id:03d}",
@@ -540,6 +947,18 @@ async def claim(ctx):
         "created_at": str(datetime.now()),
         "completed_at": None
     })
+
+    second_id = next_id + 1
+    game_commands.append({
+        "id": f"cmd_{second_id:03d}",
+        "steam_id": steam_id,
+        "player_name": player["name"],
+        "item": purchases[purchase_index]["item"],
+        "command": hunger_command_text,
+        "status": "PENDING",
+        "created_at": str(datetime.now()),
+        "completed_at": None
+    })
     save_game_commands(game_commands)
 
     purchases[purchase_index]["status"] = "QUEUED_FOR_PRIME"
@@ -547,11 +966,14 @@ async def claim(ctx):
     purchases[purchase_index]["delivery_note"] = command_text
     save_purchases(purchases)
 
+    print(f"[CLAIM QUEUED] {player['name']} | {steam_id} | {command_text}")
+
     await ctx.send(
         f"⚡ **PRIME QUEUED**\n\n"
         f"🧬 Dino: **{purchases[purchase_index]['item'].upper()}**\n"
         f"👤 Player: **{player['name']}**\n"
-        f"📨 Command queued: `{command_text}`\n\n"
+        f"📨 Command queued: `{command_text}`\n"
+        f"🍖 Hunger set to 100 queued: `{hunger_command_text}`\n\n"
         f"Stay in game while the admin bridge sends it."
     )
 
@@ -620,4 +1042,5 @@ async def leaderboard(ctx):
     await ctx.send("\n".join(lines))
 
 
-bot.run(TOKEN)
+if __name__ == "__main__":
+    bot.run(TOKEN)
