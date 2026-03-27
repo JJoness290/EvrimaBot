@@ -21,8 +21,6 @@ ANNOUNCEMENT_QUEUE_FILE = Path("announcement_queue.json")
 
 PURCHASE_TIMEOUT_MINUTES = 15
 QUEUED_TIMEOUT_MINUTES = 5
-CLAIM_POST_GROWTH_DELAY_SECONDS = 1.5
-CLAIM_HUNGER_RETRY_DELAY_SECONDS = 1.0
 
 DEFAULT_SCAN_INTERVAL = 5
 DEFAULT_REWARD_INTERVAL_MINUTES = 60
@@ -499,40 +497,22 @@ def process_game_command_queue():
         steam_id = cmd.get("steam_id")
         item = str(cmd.get("item", "")).lower().strip()
         command_text = cmd.get("command", "")
-        hunger_command_text = f"/hunger {steam_id} 100"
 
         cmd["status"] = "SENDING"
         changed_commands = True
 
         try:
-            print(f"[CLAIM STARTED] {steam_id} | {item}")
             run_rcon(command_text)
-            print(f"[GROW COMMAND SENT] {steam_id} | {command_text}")
-            time.sleep(CLAIM_POST_GROWTH_DELAY_SECONDS)
-
-            try:
-                run_rcon(hunger_command_text)
-                print(f"[HUNGER COMMAND SENT] {steam_id} | {hunger_command_text}")
-            except Exception as hunger_error:
-                print(f"[HUNGER COMMAND ERROR] {steam_id} | {hunger_error}")
-
-            time.sleep(CLAIM_HUNGER_RETRY_DELAY_SECONDS)
-
-            try:
-                run_rcon(hunger_command_text)
-                print(f"[HUNGER RETRY SENT] {steam_id} | {hunger_command_text}")
-            except Exception as hunger_retry_error:
-                print(f"[HUNGER RETRY ERROR] {steam_id} | {hunger_retry_error}")
-
             cmd["status"] = "SENT"
             cmd["completed_at"] = str(datetime.now())
-            print(f"[CLAIM COMPLETED] {steam_id} | {item} | {command_text}")
+            print(f"[CLAIM QUEUED] {steam_id} | {item} | {command_text}")
 
             for purchase in purchases:
                 if (
                     purchase.get("steam_id") == steam_id
                     and str(purchase.get("item", "")).lower().strip() == item
                     and purchase.get("status") == "QUEUED_FOR_PRIME"
+                    and str(command_text).startswith("/hunger ")
                 ):
                     purchase["status"] = "DELIVERED"
                     purchase["delivery_note"] = command_text
@@ -609,7 +589,7 @@ async def announcement_loop():
 
     try:
         current_time = time.time()
-        if current_time - last_announcement_time >= 15:
+        if current_time - last_announcement_time >= 600:
             message = announcement_messages[announcement_index % len(announcement_messages)]
             queue_data = load_announcement_queue()
             next_id = get_next_announcement_id(queue_data)
@@ -645,7 +625,7 @@ async def on_ready():
     print("[ANNOUNCEMENTS STARTED]")
 
     if last_announcement_time == 0:
-        last_announcement_time = time.time() - 15
+        last_announcement_time = time.time() - 600
 
     await asyncio.sleep(5)
     queue_data = load_announcement_queue()
@@ -887,9 +867,13 @@ async def claim(ctx):
 
     game_commands = load_game_commands()
 
+    prime_command_text = f"/elder {steam_id} prime"
+    hunger_command_text = f"/hunger {steam_id} 100"
+
     existing_pending = any(
         cmd.get("steam_id") == steam_id
         and str(cmd.get("item", "")).lower().strip() == str(purchases[purchase_index]["item"]).lower().strip()
+        and str(cmd.get("command", "")) in {prime_command_text, hunger_command_text}
         and cmd.get("status") in {"PENDING", "SENDING"}
         for cmd in game_commands
     )
@@ -903,7 +887,7 @@ async def claim(ctx):
         return
 
     next_id = get_next_command_id(game_commands)
-    command_text = f"/elder {steam_id} prime"
+    command_text = prime_command_text
 
     game_commands.append({
         "id": f"cmd_{next_id:03d}",
@@ -911,6 +895,18 @@ async def claim(ctx):
         "player_name": player["name"],
         "item": purchases[purchase_index]["item"],
         "command": command_text,
+        "status": "PENDING",
+        "created_at": str(datetime.now()),
+        "completed_at": None
+    })
+
+    second_id = next_id + 1
+    game_commands.append({
+        "id": f"cmd_{second_id:03d}",
+        "steam_id": steam_id,
+        "player_name": player["name"],
+        "item": purchases[purchase_index]["item"],
+        "command": hunger_command_text,
         "status": "PENDING",
         "created_at": str(datetime.now()),
         "completed_at": None
@@ -928,7 +924,8 @@ async def claim(ctx):
         f"⚡ **PRIME QUEUED**\n\n"
         f"🧬 Dino: **{purchases[purchase_index]['item'].upper()}**\n"
         f"👤 Player: **{player['name']}**\n"
-        f"📨 Command queued: `{command_text}`\n\n"
+        f"📨 Command queued: `{command_text}`\n"
+        f"🍖 Hunger set to 100 queued: `{hunger_command_text}`\n\n"
         f"Stay in game while the admin bridge sends it."
     )
 
