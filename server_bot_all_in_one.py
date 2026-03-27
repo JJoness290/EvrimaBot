@@ -17,6 +17,7 @@ PURCHASES_FILE = Path("purchases.json")
 GAME_COMMANDS_FILE = Path("game_commands.json")
 REFERRALS_FILE = Path("referrals.json")
 CONFIG_FILE = Path("config.json")
+ANNOUNCEMENT_QUEUE_FILE = Path("announcement_queue.json")
 
 PURCHASE_TIMEOUT_MINUTES = 15
 QUEUED_TIMEOUT_MINUTES = 5
@@ -130,6 +131,29 @@ def save_state():
         "last_minute_tick": last_minute_tick,
     }
     save_json(STATE_FILE, state)
+
+
+def load_announcement_queue():
+    return load_json(ANNOUNCEMENT_QUEUE_FILE, [])
+
+
+def save_announcement_queue(data):
+    save_json(ANNOUNCEMENT_QUEUE_FILE, data)
+
+
+def get_next_announcement_id(queue_data):
+    if not queue_data:
+        return "ann_001"
+
+    max_id = 0
+    for entry in queue_data:
+        try:
+            aid = int(str(entry.get("id", "0")).replace("ann_", ""))
+            max_id = max(max_id, aid)
+        except Exception:
+            pass
+
+    return f"ann_{(max_id + 1):03d}"
 
 
 def ensure_referral_record(referrals, discord_id: str):
@@ -318,26 +342,6 @@ def run_rcon(command):
 
 def clean_message(msg):
     return msg.encode("ascii", "ignore").decode()
-
-
-def send_announcement(message):
-    cleaned = clean_message(message)
-    command = f"announce {cleaned}"
-    print(f"[ANNOUNCEMENT DEBUG] cmd=announce {cleaned}")
-    result = subprocess.run([
-        "python",
-        RCON_SCRIPT,
-        "--ip", RCON_IP,
-        "--port", RCON_PORT,
-        "--password", RCON_PASSWORD,
-        "--command", command
-    ], input="\n", capture_output=True, text=True)
-
-    print(f"[ANNOUNCEMENT RETURN CODE] {result.returncode}")
-    print(f"[ANNOUNCEMENT STDOUT] {result.stdout}")
-    print(f"[ANNOUNCEMENT STDERR] {result.stderr}")
-
-    return (result.stdout or "") + (result.stderr or "")
 
 
 def get_players_from_rcon():
@@ -586,13 +590,17 @@ async def announcement_loop():
         current_time = time.time()
         if current_time - last_announcement_time >= 15:
             message = announcement_messages[announcement_index % len(announcement_messages)]
-            response = await asyncio.to_thread(run_rcon, f"announce {message}")
-            print(f"[ANNOUNCEMENT DEBUG] cmd=announce {message}")
-            print(f"[ANNOUNCEMENT RESPONSE] {response}")
-            if "Announced" in response:
-                print(f"[ANNOUNCEMENT SUCCESS] {message}")
-            else:
-                print("[ANNOUNCEMENT FAILED]")
+            queue_data = load_announcement_queue()
+            next_id = get_next_announcement_id(queue_data)
+            queue_data.append({
+                "id": next_id,
+                "message": message,
+                "status": "PENDING",
+                "created_at": str(datetime.now()),
+                "completed_at": None
+            })
+            save_announcement_queue(queue_data)
+            print(f"[ANNOUNCEMENT QUEUED] {message}")
             last_announcement_time = current_time
             announcement_index = (announcement_index + 1) % len(announcement_messages)
     except Exception as e:
@@ -619,8 +627,17 @@ async def on_ready():
         last_announcement_time = time.time() - 15
 
     await asyncio.sleep(5)
-    test_response = await asyncio.to_thread(send_announcement, "TEST MESSAGE FROM BOT")
-    print(f"[STARTUP TEST] {test_response}")
+    queue_data = load_announcement_queue()
+    next_id = get_next_announcement_id(queue_data)
+    queue_data.append({
+        "id": next_id,
+        "message": "TEST MESSAGE FROM BOT",
+        "status": "PENDING",
+        "created_at": str(datetime.now()),
+        "completed_at": None
+    })
+    save_announcement_queue(queue_data)
+    print("[ANNOUNCEMENT QUEUED] TEST MESSAGE FROM BOT")
 
     for guild in bot.guilds:
         await cache_guild_invites(guild)
