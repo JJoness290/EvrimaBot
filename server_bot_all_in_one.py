@@ -21,6 +21,8 @@ ANNOUNCEMENT_QUEUE_FILE = Path("announcement_queue.json")
 
 PURCHASE_TIMEOUT_MINUTES = 15
 QUEUED_TIMEOUT_MINUTES = 5
+CLAIM_POST_GROWTH_DELAY_SECONDS = 1.5
+CLAIM_HUNGER_RETRY_DELAY_SECONDS = 1.0
 
 DEFAULT_SCAN_INTERVAL = 5
 DEFAULT_REWARD_INTERVAL_MINUTES = 60
@@ -497,15 +499,34 @@ def process_game_command_queue():
         steam_id = cmd.get("steam_id")
         item = str(cmd.get("item", "")).lower().strip()
         command_text = cmd.get("command", "")
+        hunger_command_text = f"/hunger {steam_id} 100"
 
         cmd["status"] = "SENDING"
         changed_commands = True
 
         try:
+            print(f"[CLAIM STARTED] {steam_id} | {item}")
             run_rcon(command_text)
+            print(f"[GROW COMMAND SENT] {steam_id} | {command_text}")
+            time.sleep(CLAIM_POST_GROWTH_DELAY_SECONDS)
+
+            try:
+                run_rcon(hunger_command_text)
+                print(f"[HUNGER COMMAND SENT] {steam_id} | {hunger_command_text}")
+            except Exception as hunger_error:
+                print(f"[HUNGER COMMAND ERROR] {steam_id} | {hunger_error}")
+
+            time.sleep(CLAIM_HUNGER_RETRY_DELAY_SECONDS)
+
+            try:
+                run_rcon(hunger_command_text)
+                print(f"[HUNGER RETRY SENT] {steam_id} | {hunger_command_text}")
+            except Exception as hunger_retry_error:
+                print(f"[HUNGER RETRY ERROR] {steam_id} | {hunger_retry_error}")
+
             cmd["status"] = "SENT"
             cmd["completed_at"] = str(datetime.now())
-            print(f"[CLAIM QUEUED] {steam_id} | {item} | {command_text}")
+            print(f"[CLAIM COMPLETED] {steam_id} | {item} | {command_text}")
 
             for purchase in purchases:
                 if (
