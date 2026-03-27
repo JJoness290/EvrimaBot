@@ -6,6 +6,8 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import subprocess
 import time
+import socket
+import struct
 
 TOKEN = "MTQ4NjQ2NTQ4ODczNjQ4NTQ0Ng.GOCPqh.UK1TpRD44ugqS2TkTfdKQalFd6u_O93LFxz2Bw"
 
@@ -17,7 +19,6 @@ PURCHASES_FILE = Path("purchases.json")
 GAME_COMMANDS_FILE = Path("game_commands.json")
 REFERRALS_FILE = Path("referrals.json")
 CONFIG_FILE = Path("config.json")
-ANNOUNCEMENT_QUEUE_FILE = Path("announcement_queue.json")
 
 PURCHASE_TIMEOUT_MINUTES = 15
 QUEUED_TIMEOUT_MINUTES = 5
@@ -131,29 +132,6 @@ def save_state():
         "last_minute_tick": last_minute_tick,
     }
     save_json(STATE_FILE, state)
-
-
-def load_announcement_queue():
-    return load_json(ANNOUNCEMENT_QUEUE_FILE, [])
-
-
-def save_announcement_queue(data):
-    save_json(ANNOUNCEMENT_QUEUE_FILE, data)
-
-
-def get_next_announcement_id(queue_data):
-    if not queue_data:
-        return "ann_001"
-
-    max_id = 0
-    for entry in queue_data:
-        try:
-            aid = int(str(entry.get("id", "0")).replace("ann_", ""))
-            max_id = max(max_id, aid)
-        except Exception:
-            pass
-
-    return f"ann_{(max_id + 1):03d}"
 
 
 def ensure_referral_record(referrals, discord_id: str):
@@ -342,6 +320,90 @@ def run_rcon(command):
 
 def clean_message(msg):
     return msg.encode("ascii", "ignore").decode()
+
+
+def _build_rcon_packet(request_id: int, packet_type: int, body: str) -> bytes:
+    payload = struct.pack("<ii", request_id, packet_type) + body.encode("utf-8") + b"\x00\x00"
+    return struct.pack("<i", len(payload)) + payload
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def _recv_rcon_packet(sock: socket.socket):
+    header = _recv_exact(sock, 4)
+    if len(header) < 4:
+        return None
+    (packet_size,) = struct.unpack("<i", header)
+    payload = _recv_exact(sock, packet_size)
+    if len(payload) < 8:
+        return None
+    request_id, packet_type = struct.unpack("<ii", payload[:8])
+    body = payload[8:-2].decode("utf-8", errors="ignore")
+    return request_id, packet_type, body
+
+
+def send_announcement_silent(message: str):
+    cleaned = clean_message(message)
+    command = f"announce {cleaned}"
+    auth_request_id = 101
+    command_request_id = 102
+    terminator_request_id = 103
+
+    print(f"[ANNOUNCEMENT DEBUG] sending: {command}")
+
+    try:
+        with socket.create_connection((RCON_IP, int(RCON_PORT)), timeout=5) as sock:
+            sock.settimeout(5)
+
+            sock.sendall(_build_rcon_packet(auth_request_id, 3, RCON_PASSWORD))
+
+            auth_ok = False
+            auth_deadline = time.time() + 5
+            while time.time() < auth_deadline:
+                packet = _recv_rcon_packet(sock)
+                if packet is None:
+                    continue
+                request_id, _, _ = packet
+                if request_id == -1:
+                    return "AUTH FAILED"
+                if request_id == auth_request_id:
+                    auth_ok = True
+                    break
+
+            if not auth_ok:
+                return "AUTH TIMEOUT"
+
+            sock.sendall(_build_rcon_packet(command_request_id, 2, command))
+            sock.sendall(_build_rcon_packet(terminator_request_id, 2, ""))
+
+            response_parts = []
+            response_deadline = time.time() + 5
+            while time.time() < response_deadline:
+                packet = _recv_rcon_packet(sock)
+                if packet is None:
+                    continue
+                request_id, _, body = packet
+                if request_id == command_request_id and body:
+                    response_parts.append(body)
+                if request_id == terminator_request_id:
+                    break
+
+            response = "\n".join(part for part in response_parts if part).strip()
+            if response:
+                return response
+            return "NO RESPONSE"
+    except socket.timeout:
+        return "TIMEOUT"
+    except Exception as e:
+        return f"ERROR: {e}"
 
 
 def get_players_from_rcon():
@@ -589,19 +651,14 @@ async def announcement_loop():
 
     try:
         current_time = time.time()
-        if current_time - last_announcement_time >= 600:
+        if current_time - last_announcement_time >= 15:
             message = announcement_messages[announcement_index % len(announcement_messages)]
-            queue_data = load_announcement_queue()
-            next_id = get_next_announcement_id(queue_data)
-            queue_data.append({
-                "id": next_id,
-                "message": message,
-                "status": "PENDING",
-                "created_at": str(datetime.now()),
-                "completed_at": None
-            })
-            save_announcement_queue(queue_data)
-            print(f"[ANNOUNCEMENT QUEUED] {message}")
+            response = await asyncio.to_thread(send_announcement_silent, message)
+            print(f"[ANNOUNCEMENT RESPONSE] {response}")
+            if "Announced" in response or "announced" in response:
+                print("[ANNOUNCEMENT SUCCESS]")
+            else:
+                print("[ANNOUNCEMENT FAILED]")
             last_announcement_time = current_time
             announcement_index = (announcement_index + 1) % len(announcement_messages)
     except Exception as e:
@@ -625,20 +682,11 @@ async def on_ready():
     print("[ANNOUNCEMENTS STARTED]")
 
     if last_announcement_time == 0:
-        last_announcement_time = time.time() - 600
+        last_announcement_time = time.time() - 15
 
     await asyncio.sleep(5)
-    queue_data = load_announcement_queue()
-    next_id = get_next_announcement_id(queue_data)
-    queue_data.append({
-        "id": next_id,
-        "message": "TEST MESSAGE FROM BOT",
-        "status": "PENDING",
-        "created_at": str(datetime.now()),
-        "completed_at": None
-    })
-    save_announcement_queue(queue_data)
-    print("[ANNOUNCEMENT QUEUED] TEST MESSAGE FROM BOT")
+    startup_response = await asyncio.to_thread(send_announcement_silent, "TEST MESSAGE FROM BOT")
+    print(f"[ANNOUNCEMENT RESPONSE] {startup_response}")
 
     for guild in bot.guilds:
         await cache_guild_invites(guild)
