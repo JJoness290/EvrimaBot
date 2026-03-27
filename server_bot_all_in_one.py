@@ -313,7 +313,7 @@ def run_rcon(command):
         "--password", RCON_PASSWORD,
         "--command", command
     ], input="\n", capture_output=True, text=True)
-    return result.stdout
+    return (result.stdout or "") + (result.stderr or "")
 
 
 def clean_message(msg):
@@ -586,15 +586,11 @@ async def announcement_loop():
         current_time = time.time()
         if current_time - last_announcement_time >= 15:
             message = announcement_messages[announcement_index % len(announcement_messages)]
-            print(f"[ANNOUNCEMENT DEBUG] sending: announce {message}")
-            response = await asyncio.to_thread(send_announcement, message)
+            response = await asyncio.to_thread(run_rcon, f"announce {message}")
+            print(f"[ANNOUNCEMENT DEBUG] cmd=announce {message}")
             print(f"[ANNOUNCEMENT RESPONSE] {response}")
             if "Announced" in response:
-                print("[ANNOUNCEMENT SUCCESS]")
-            elif "TIMEOUT" in response:
-                print("[ANNOUNCEMENT FAILED]")
-            elif "AUTH FAILED" in response:
-                print("[ANNOUNCEMENT FAILED]")
+                print(f"[ANNOUNCEMENT SUCCESS] {message}")
             else:
                 print("[ANNOUNCEMENT FAILED]")
             last_announcement_time = current_time
@@ -620,7 +616,7 @@ async def on_ready():
     print("[ANNOUNCEMENTS STARTED]")
 
     if last_announcement_time == 0:
-        last_announcement_time = time.time() - 600
+        last_announcement_time = time.time() - 15
 
     await asyncio.sleep(5)
     test_response = await asyncio.to_thread(send_announcement, "TEST MESSAGE FROM BOT")
