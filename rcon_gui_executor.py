@@ -5,6 +5,7 @@ from datetime import datetime
 
 ANNOUNCEMENT_QUEUE_FILE = Path("announcement_queue.json")
 WINDOW_TITLE_CONTAINS = "Evrima RCON"
+REQUIRE_EXISTING_WINDOW = True
 
 
 def load_json(path: Path, default):
@@ -35,13 +36,12 @@ def find_pending_job(queue_data):
     return None
 
 
-def execute_announcement_with_gui(message: str) -> bool:
+def find_existing_rcon_window():
     try:
-        import pyautogui
         import pygetwindow as gw
     except Exception:
         print("[RCON GUI EXECUTOR] FAILED (pyautogui/pygetwindow not available)")
-        return False
+        return None
 
     try:
         matching = []
@@ -50,10 +50,30 @@ def execute_announcement_with_gui(message: str) -> bool:
                 matching.append(title)
 
         if not matching:
-            print("[RCON GUI EXECUTOR] FAILED (window not found)")
-            return False
+            return None
 
         target_window = gw.getWindowsWithTitle(matching[0])[0]
+        return target_window
+    except Exception:
+        return None
+
+
+def execute_announcement_with_gui(message: str) -> bool:
+    try:
+        import pyautogui
+    except Exception:
+        print("[RCON GUI EXECUTOR] FAILED (pyautogui/pygetwindow not available)")
+        return False
+
+    try:
+        target_window = None
+        if REQUIRE_EXISTING_WINDOW:
+            target_window = find_existing_rcon_window()
+            if not target_window:
+                print("[RCON GUI EXECUTOR] Window not found, announcement left pending")
+                return False
+            print("[RCON GUI EXECUTOR] Found existing window")
+
         target_window.activate()
         time.sleep(0.6)
 
@@ -98,6 +118,10 @@ def process_queue_once():
         save_queue(queue_data)
         print("[RCON GUI EXECUTOR] DONE")
     else:
+        existing_window = find_existing_rcon_window()
+        if REQUIRE_EXISTING_WINDOW and not existing_window:
+            print("[RCON GUI EXECUTOR] Window not found, leaving pending")
+            return
         job["status"] = "FAILED"
         job["completed_at"] = str(datetime.now())
         save_queue(queue_data)
